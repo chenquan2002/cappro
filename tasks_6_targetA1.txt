@@ -1,6 +1,0 @@
-click_bell
-pick_diverse_bottles
-place_a2b_right
-place_container_plate
-move_playingcard_away
-place_mouse_pad
