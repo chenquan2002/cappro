@@ -1,0 +1,10 @@
+handover_block
+hanging_mug
+place_burger_fries
+place_can_basket
+place_object_basket
+stack_blocks_three
+stack_blocks_two
+stack_bowls_three
+blocks_ranking_rgb
+blocks_ranking_size

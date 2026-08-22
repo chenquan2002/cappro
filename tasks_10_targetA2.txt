@@ -1,0 +1,10 @@
+turn_switch
+lift_pot
+move_pillbottle_pad
+place_phone_stand
+place_object_scale
+place_object_stand
+place_bread_skillet
+place_cans_plasticbox
+beat_block_hammer
+stamp_seal
