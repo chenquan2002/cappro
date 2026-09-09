@@ -59,6 +59,9 @@ _DEFAULT_SUPPORT_ASSETS_DIR = (
 _DEFAULT_SUPPORT_MANIFEST_PATH = (
     _ROBOTWIN_ROOT / "data" / "support_data" / "manifests" / "cappro_place_fan_phase_manifest.jsonl"
 )
+_SOURCE13_PHASE_EGO_MANIFEST_PATH = (
+    _ROBOTWIN_ROOT / "data" / "support_data" / "manifests" / "cappro_source13_phase_ego_manifest.jsonl"
+)
 _SOURCE_NORM_STATS_ASSET_ID = "source_data_iclpi_repo"
 
 
@@ -1127,6 +1130,200 @@ _CONFIGS = [
         fsdp_devices=1,
         save_interval=10_000
     ),
+    # CapPro full source13 phase-caption training with ego support videos.
+    TrainConfig(
+        name="pi05_aloha_robotwin_cappro_source13_full_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_support_context=True,
+            num_support_frames=8,
+            use_support_progress=True,
+            use_support_role_embedding=True,
+            support_progress_embed_dim=128,
+            use_support_token_compression=True,
+            support_static_tokens=64,
+            support_motion_tokens_per_frame=24,
+            support_compression_temperature=1.0,
+            use_caption_supervision=True,
+            caption_max_len=96,
+            caption_decode_chunk_size=4,
+            caption_loss_weight=0.1,
+            num_caption_queries=4,
+            caption_action_gate_init=0.1,
+            caption_robot_tokens_per_image=64,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id=os.getenv("REPO_ID", "source_data_hovapi_repo"),
+            assets=AssetsConfig(
+                assets_dir=str(_DEFAULT_SUPPORT_ASSETS_DIR),
+                asset_id="source_data_iclpi_repo",
+            ),
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                local_files_only=True,
+                prompt_from_task=True,
+                use_support_context=True,
+                support_manifest_path=os.getenv(
+                    "SUPPORT_MANIFEST_PATH",
+                    str(_SOURCE13_PHASE_EGO_MANIFEST_PATH),
+                ),
+                support_rounds_per_cycle=5,
+                support_cache_size=1024,
+                num_support_frames=8,
+                support_chunk_size=1,
+                support_view_override="ego",
+                use_caption_supervision=True,
+                caption_max_len=96,
+            ),
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_support_context=True,
+            use_caption_supervision=True,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(str(_PI05_BASE_PARAMS)),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-10,
+            clip_gradient_norm=1.0,
+        ),
+        seed=42,
+        batch_size=128,
+        num_workers=2,
+        num_train_steps=200_000,
+        log_interval=100,
+        save_interval=5_000,
+        keep_period=50_000,
+        ema_decay=None,
+        wandb_enabled=True,
+        fsdp_devices=1,
+    ),
+    # CapPro source13 GridS training without robot chunk-progress input in the
+    # action prefix. Chunk progress remains in the observation/data bookkeeping
+    # fields, but is not passed to action inference.
+    TrainConfig(
+        name="pi05_aloha_robotwin_cappro_source13_grids_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_support_context=True,
+            num_support_frames=8,
+            use_support_progress=True,
+            use_support_role_embedding=True,
+            support_progress_embed_dim=128,
+            use_support_grid_sampling=True,
+            support_grid_hidden_dim=int(os.getenv("SUPPORT_GRID_HIDDEN_DIM", "256")),
+            support_grid_tokens_per_frame=int(os.getenv("SUPPORT_GRID_TOKENS_PER_FRAME", "32")),
+            use_support_token_compression=False,
+            use_caption_supervision=True,
+            caption_max_len=96,
+            caption_decode_chunk_size=4,
+            caption_loss_weight=0.1,
+            num_caption_queries=4,
+            caption_action_gate_init=0.1,
+            caption_robot_tokens_per_image=64,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id=os.getenv("REPO_ID", "source_data_hovapi_repo"),
+            assets=AssetsConfig(
+                assets_dir=str(_DEFAULT_SUPPORT_ASSETS_DIR),
+                asset_id="source_data_iclpi_repo",
+            ),
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                local_files_only=True,
+                prompt_from_task=True,
+                use_support_context=True,
+                support_manifest_path=os.getenv(
+                    "SUPPORT_MANIFEST_PATH",
+                    str(_SOURCE13_PHASE_EGO_MANIFEST_PATH),
+                ),
+                support_rounds_per_cycle=5,
+                support_cache_size=1024,
+                num_support_frames=8,
+                support_chunk_size=1,
+                support_view_override="ego",
+                use_caption_supervision=True,
+                caption_max_len=96,
+            ),
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_support_context=True,
+            use_caption_supervision=True,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(str(_PI05_BASE_PARAMS)),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=200_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-10,
+            clip_gradient_norm=1.0,
+        ),
+        seed=42,
+        batch_size=128,
+        num_workers=2,
+        num_train_steps=200_000,
+        log_interval=100,
+        save_interval=5_000,
+        keep_period=50_000,
+        ema_decay=None,
+        wandb_enabled=True,
+        fsdp_devices=1,
+    ),
     # CapPro single-task phase-caption training for place_fan/demo_clean.
     TrainConfig(
         name="pi05_aloha_robotwin_cappro_place_fan_clean_lora",
@@ -1191,6 +1388,105 @@ _CONFIGS = [
                 support_chunk_size=1,
                 # This experiment always trains from the ego human-video view.
                 # Non-ego manifest records are remapped to the matching ego path.
+                support_view_override="ego",
+                use_caption_supervision=True,
+                caption_max_len=96,
+            ),
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_support_context=True,
+            use_caption_supervision=True,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(str(_PI05_BASE_PARAMS)),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-10,
+            clip_gradient_norm=1.0,
+        ),
+        seed=42,
+        batch_size=64,
+        num_workers=2,
+        num_train_steps=7_500,
+        log_interval=100,
+        save_interval=5_000,
+        keep_period=5_000,
+        ema_decay=None,
+        wandb_enabled=True,
+        # Two visible H100s form two data-parallel replicas; the model is not sharded.
+        fsdp_devices=1,
+    ),
+    # GridS version of the place_fan/demo_clean CapPro experiment above. It
+    # starts from the same pi0.5 base parameters as the heuristic baseline so
+    # the compression method is the controlled experimental variable.
+    TrainConfig(
+        name="pi05_aloha_robotwin_cappro_place_fan_clean_grids_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_support_context=True,
+            num_support_frames=8,
+            use_support_progress=True,
+            use_support_role_embedding=True,
+            support_progress_embed_dim=128,
+            use_support_grid_sampling=True,
+            support_grid_hidden_dim=int(os.getenv("SUPPORT_GRID_HIDDEN_DIM", "256")),
+            support_grid_tokens_per_frame=int(os.getenv("SUPPORT_GRID_TOKENS_PER_FRAME", "32")),
+            use_support_token_compression=False,
+            use_caption_supervision=True,
+            caption_max_len=96,
+            caption_decode_chunk_size=4,
+            caption_loss_weight=0.1,
+            num_caption_queries=4,
+            caption_action_gate_init=0.1,
+            caption_robot_tokens_per_image=64,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id=os.getenv("REPO_ID", "source_data_hovapi_repo"),
+            assets=AssetsConfig(
+                assets_dir=str(_DEFAULT_SUPPORT_ASSETS_DIR),
+                asset_id="source_data_iclpi_repo",
+            ),
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                local_files_only=True,
+                prompt_from_task=True,
+                use_support_context=True,
+                support_manifest_path=os.getenv(
+                    "SUPPORT_MANIFEST_PATH",
+                    str(_DEFAULT_SUPPORT_MANIFEST_PATH),
+                ),
+                support_rounds_per_cycle=20,
+                support_cache_size=1024,
+                num_support_frames=8,
+                support_chunk_size=1,
                 support_view_override="ego",
                 use_caption_supervision=True,
                 caption_max_len=96,

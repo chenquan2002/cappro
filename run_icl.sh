@@ -31,7 +31,11 @@ case "${data_scope}" in
         ;;
 esac
 
-model_name="${MODEL_NAME:-cappro_place_fan_clean_phase_v1}"
+default_model_name="cappro_place_fan_clean_phase_v1"
+if [[ "${train_config_name}" == "pi05_aloha_robotwin_cappro_place_fan_clean_grids_lora" ]]; then
+    default_model_name="cappro_place_fan_clean_grids_phase_v1"
+fi
+model_name="${MODEL_NAME:-${default_model_name}}"
 repo_id="${REPO_ID:-source_data_hovapi_repo}"
 
 export XDG_CACHE_HOME="${ROBOTWIN_ROOT}/data/lerobot_data"
@@ -57,6 +61,11 @@ export BATCH_SIZE="${BATCH_SIZE:-64}"
 export NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-7500}"
 IFS=',' read -r -a visible_gpu_ids <<< "${gpu_use}"
 visible_gpu_count="${#visible_gpu_ids[@]}"
+default_support_grid_sampling=false
+if [[ "${train_config_name}" == "pi05_aloha_robotwin_cappro_place_fan_clean_grids_lora" ]]; then
+    default_support_grid_sampling=true
+fi
+
 per_gpu_batch_size="invalid"
 if [[ "${BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] && (( BATCH_SIZE % visible_gpu_count == 0 )); then
     per_gpu_batch_size="$((BATCH_SIZE / visible_gpu_count))"
@@ -67,6 +76,11 @@ if [[ ! -d "${DEFAULT_SUPPORT_ASSETS_DIR}" ]]; then
 fi
 export SUPPORT_ASSETS_DIR="${SUPPORT_ASSETS_DIR:-${DEFAULT_SUPPORT_ASSETS_DIR}}"
 norm_stats_dir="${SUPPORT_ASSETS_DIR}"
+export USE_SUPPORT_GRID_SAMPLING="${USE_SUPPORT_GRID_SAMPLING:-${default_support_grid_sampling}}"
+export SUPPORT_GRID_TOKENS_PER_FRAME="${SUPPORT_GRID_TOKENS_PER_FRAME:-32}"
+if [[ "${train_config_name}" == "pi05_aloha_robotwin_cappro_place_fan_clean_grids_lora" ]]; then
+    export USE_SUPPORT_TOKEN_COMPRESSION="false"
+fi
 norm_stats_asset_id="${repo_id}"
 if [[ "${data_scope}" == "source" ]]; then
     export SOURCE_NORM_STATS_DIR="${SOURCE_NORM_STATS_DIR:-${SUPPORT_ASSETS_DIR}}"
@@ -98,6 +112,8 @@ echo "num_caption_queries: ${NUM_CAPTION_QUERIES}"
 echo "caption_action_gate_init: ${CAPTION_ACTION_GATE_INIT}"
 echo "caption_robot_tokens_per_image: ${CAPTION_ROBOT_TOKENS_PER_IMAGE}"
 echo "support_token_compression: ${USE_SUPPORT_TOKEN_COMPRESSION}"
+echo "support_grid_sampling: ${USE_SUPPORT_GRID_SAMPLING}"
+echo "support_grid_tokens_per_frame: ${SUPPORT_GRID_TOKENS_PER_FRAME}"
 echo "support_rounds_per_cycle: ${SUPPORT_ROUNDS_PER_CYCLE}"
 echo "support_chunk_size: ${SUPPORT_CHUNK_SIZE}"
 echo "support_manifest: ${SUPPORT_MANIFEST_PATH}"

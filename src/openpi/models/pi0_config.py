@@ -40,11 +40,20 @@ class Pi0Config(_model.BaseModelConfig):
     use_support_role_embedding: bool = True
     support_progress_embed_dim: int = 128
 
-    # 8 frames x 256 SigLIP tokens are compressed to 64 + 8 x 24 tokens.
+    # Legacy heuristic compression: 8 frames x 256 SigLIP tokens become
+    # 64 static + 8 x 24 motion tokens. Kept for ablations/backward
+    # compatibility when GridS is disabled.
     use_support_token_compression: bool = True
     support_static_tokens: int = 64
     support_motion_tokens_per_frame: int = 24
     support_compression_temperature: float = 1.0
+
+    # Optional GridS replacement for the heuristic static/motion compressor.
+    # When enabled, each support frame is compressed independently with a
+    # shared, differentiable coordinate predictor and bilinear sampler.
+    use_support_grid_sampling: bool = False
+    support_grid_hidden_dim: int = 256
+    support_grid_tokens_per_frame: int = 32
 
     # Caption supervision and semantic query tokens. Caption input tokens remain
     # train-only; the query outputs can be passed to the action prefix.
@@ -67,13 +76,18 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("num_support_frames must be >= 1")
         if self.support_progress_embed_dim < 2 or self.support_progress_embed_dim % 2 != 0:
             raise ValueError("support_progress_embed_dim must be a positive even number")
-        static_grid_size = math.isqrt(self.support_static_tokens)
-        if static_grid_size * static_grid_size != self.support_static_tokens:
-            raise ValueError("support_static_tokens must be a square number")
-        if not 1 <= self.support_motion_tokens_per_frame <= 256:
-            raise ValueError("support_motion_tokens_per_frame must be in [1, 256]")
-        if self.support_compression_temperature <= 0:
-            raise ValueError("support_compression_temperature must be > 0")
+        if not self.use_support_grid_sampling:
+            static_grid_size = math.isqrt(self.support_static_tokens)
+            if static_grid_size * static_grid_size != self.support_static_tokens:
+                raise ValueError("support_static_tokens must be a square number")
+            if not 1 <= self.support_motion_tokens_per_frame <= 256:
+                raise ValueError("support_motion_tokens_per_frame must be in [1, 256]")
+            if self.support_compression_temperature <= 0:
+                raise ValueError("support_compression_temperature must be > 0")
+        if self.support_grid_tokens_per_frame < 1:
+            raise ValueError("support_grid_tokens_per_frame must be >= 1")
+        if self.support_grid_hidden_dim < 2:
+            raise ValueError("support_grid_hidden_dim must be >= 2")
         if self.use_caption_supervision and not self.use_support_context:
             raise ValueError("use_caption_supervision=True requires use_support_context=True")
         if self.caption_max_len < 1:
@@ -180,6 +194,8 @@ class Pi0Config(_model.BaseModelConfig):
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         """Returns the freeze filter based on the model config."""
+        # Support-video modules (including GridS) are intentionally outside
+        # the LLM path filters below, so they remain trainable in LoRA runs.
         filters = []
         has_lora = False
         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")

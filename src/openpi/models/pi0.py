@@ -321,6 +321,83 @@ def spatial_pool_image_tokens(tokens, *, num_tokens: int):
     return jnp.mean(pooled, axis=2).astype(dtype)
 
 
+def bilinear_sample_image_tokens(tokens, coordinates):
+    """Differentiably sample a square visual-token grid at continuous points.
+
+    Args:
+        tokens: Float array with shape ``[B, K, H, W, D]``.
+        coordinates: Float array with shape ``[B, K, S, 2]``. The final
+            dimension is ``(x, y)`` in normalized ``[0, 1]`` coordinates.
+
+    Returns:
+        Sampled tokens with shape ``[B, K, S, D]``. The interpolation weights
+        are differentiable with respect to ``coordinates``; this is the path
+        through which the action loss trains a GridS coordinate predictor.
+    """
+    if tokens.ndim != 5 or coordinates.ndim != 4:
+        raise ValueError(
+            f"Expected tokens [B,K,H,W,D] and coordinates [B,K,S,2], "
+            f"got {tokens.shape} and {coordinates.shape}"
+        )
+    if tokens.shape[:2] != coordinates.shape[:2] or coordinates.shape[-1] != 2:
+        raise ValueError(
+            f"Token/frame dimensions and coordinate dimensions must match, "
+            f"got {tokens.shape} and {coordinates.shape}"
+        )
+
+    batch_size, num_frames, height, width, dim = tokens.shape
+    if height < 1 or width < 1:
+        raise ValueError(f"Token grid must be non-empty, got {height}x{width}")
+
+    # Compute interpolation in float32 even when the model runs in bfloat16.
+    grid = tokens.astype(jnp.float32).reshape(batch_size, num_frames, height * width, dim)
+    points = jnp.clip(coordinates.astype(jnp.float32), 0.0, 1.0)
+    x = points[..., 0] * max(width - 1, 0)
+    y = points[..., 1] * max(height - 1, 0)
+    x0 = jnp.floor(x).astype(jnp.int32)
+    y0 = jnp.floor(y).astype(jnp.int32)
+    x1 = jnp.minimum(x0 + 1, width - 1)
+    y1 = jnp.minimum(y0 + 1, height - 1)
+    dx = x - x0.astype(x.dtype)
+    dy = y - y0.astype(y.dtype)
+
+    def gather(row, column):
+        indices = row * width + column
+        return jnp.take_along_axis(grid, indices[..., None], axis=2)
+
+    top_left = gather(y0, x0)
+    top_right = gather(y0, x1)
+    bottom_left = gather(y1, x0)
+    bottom_right = gather(y1, x1)
+    weights = (
+        (1.0 - dx) * (1.0 - dy),
+        dx * (1.0 - dy),
+        (1.0 - dx) * dy,
+        dx * dy,
+    )
+    sampled = (
+        top_left * weights[0][..., None]
+        + top_right * weights[1][..., None]
+        + bottom_left * weights[2][..., None]
+        + bottom_right * weights[3][..., None]
+    )
+    # Keep the interpolation in float32 until the caller combines it with
+    # coordinate embeddings. The final cast happens once before prefix
+    # construction, avoiding an unnecessary low-precision round-trip here.
+    return sampled
+
+
+def masked_global_average_image_tokens(tokens, frame_mask):
+    """Average each spatial token grid while zeroing invalid support frames."""
+    if tokens.ndim != 5 or frame_mask.shape != tokens.shape[:2]:
+        raise ValueError(
+            f"Expected tokens [B,K,H,W,D] and frame_mask [B,K], got {tokens.shape} and {frame_mask.shape}"
+        )
+    valid = frame_mask.astype(jnp.bool_)[..., None, None, None]
+    finite_tokens = jnp.where(valid, tokens.astype(jnp.float32), 0.0)
+    return jnp.mean(finite_tokens, axis=(2, 3))
+
+
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
@@ -355,6 +432,9 @@ class Pi0(_model.BaseModel):
         self.support_static_tokens = config.support_static_tokens
         self.support_motion_tokens_per_frame = config.support_motion_tokens_per_frame
         self.support_compression_temperature = config.support_compression_temperature
+        self.use_support_grid_sampling = config.use_support_grid_sampling
+        self.support_grid_hidden_dim = config.support_grid_hidden_dim
+        self.support_grid_tokens_per_frame = config.support_grid_tokens_per_frame
         self.use_caption_supervision = config.use_caption_supervision
         self.caption_decode_chunk_size = config.caption_decode_chunk_size
         self.caption_loss_weight = config.caption_loss_weight
@@ -369,6 +449,24 @@ class Pi0(_model.BaseModel):
             )
             self.support_progress_mlp_out = nnx.Linear(
                 paligemma_config.width,
+                paligemma_config.width,
+                rngs=rngs,
+            )
+        if self.use_support_context and self.use_support_grid_sampling:
+            # GridS predicts S continuous (x, y) points from each frame's
+            # global visual summary. Parameters are shared by all frames.
+            self.support_grid_mlp_in = nnx.Linear(
+                paligemma_config.width,
+                self.support_grid_hidden_dim,
+                rngs=rngs,
+            )
+            self.support_grid_mlp_out = nnx.Linear(
+                self.support_grid_hidden_dim,
+                2 * self.support_grid_tokens_per_frame,
+                rngs=rngs,
+            )
+            self.support_grid_coord_proj = nnx.Linear(
+                2,
                 paligemma_config.width,
                 rngs=rngs,
             )
@@ -480,6 +578,40 @@ class Pi0(_model.BaseModel):
     def _encode_robot_images(self, obs: _model.Observation):
         return {name: self.PaliGemma.img(image, train=False)[0] for name, image in obs.images.items()}
 
+    def _grid_sample_support_tokens(self, support_image_tokens, support_image_mask):
+        """Apply a shared, frame-wise GridS sampler to support SigLIP tokens."""
+        batch_size, num_frames, tokens_per_frame, dim = support_image_tokens.shape
+        grid_size = int(tokens_per_frame**0.5)
+        if grid_size * grid_size != tokens_per_frame:
+            raise ValueError(
+                f"Support image tokens must form a square grid for GridS, got {tokens_per_frame}"
+            )
+
+        grid = einops.rearrange(
+            support_image_tokens.astype(jnp.float32),
+            "b k (h w) d -> b k h w d",
+            h=grid_size,
+            w=grid_size,
+        )
+        pooled = masked_global_average_image_tokens(grid, support_image_mask)
+        pooled = pooled.reshape(batch_size * num_frames, dim)
+        hidden = self.support_grid_mlp_in(pooled)
+        hidden = nnx.swish(hidden)
+        coord_logits = self.support_grid_mlp_out(hidden)
+        coordinates = jax.nn.sigmoid(
+            coord_logits.reshape(batch_size, num_frames, self.support_grid_tokens_per_frame, 2)
+        )
+
+        sampled = bilinear_sample_image_tokens(grid, coordinates)
+
+        # Inject the predicted coordinates after sampling, as in GridS. This
+        # preserves spatial identity even when two points read similar visual
+        # features. The projection is shared across all frames and points.
+        coord_features = self.support_grid_coord_proj(coordinates * 2.0 - 1.0)
+        sampled = sampled.astype(coord_features.dtype) + coord_features
+        sampled = sampled * support_image_mask.astype(sampled.dtype)[..., None, None]
+        return sampled.astype(support_image_tokens.dtype)
+
     def _prepare_robot_tokens(self, obs: _model.Observation, robot_image_tokens):
         tokens = []
         masks = []
@@ -512,7 +644,16 @@ class Pi0(_model.BaseModel):
         else:
             support_image_mask = support_image_mask.astype(jnp.bool_)
 
-        value_tokens = support_image_tokens
+        # GridS operates on raw SigLIP features. Progress is deliberately
+        # attached only after sampling so that phase metadata cannot change the
+        # learned visual coordinates (and caption context never sees robot
+        # chunk progress).
+        if self.use_support_grid_sampling:
+            support_tokens = self._grid_sample_support_tokens(support_image_tokens, support_image_mask)
+            tokens_per_frame = self.support_grid_tokens_per_frame
+            value_tokens = support_tokens
+        else:
+            value_tokens = support_image_tokens
         if self.use_support_progress:
             if obs.support_frame_progress is None:
                 raise ValueError("use_support_progress=True requires support_frame_progress")
@@ -526,7 +667,14 @@ class Pi0(_model.BaseModel):
             )
             value_tokens = value_tokens + progress_embedding
 
-        if self.use_support_token_compression:
+        if self.use_support_grid_sampling:
+            support_tokens = einops.rearrange(value_tokens, "b k s d -> b (k s) d")
+            support_token_mask = einops.repeat(
+                support_image_mask,
+                "b k -> b (k s)",
+                s=tokens_per_frame,
+            )
+        elif self.use_support_token_compression:
             support_tokens, support_token_mask = compress_support_image_tokens(
                 value_tokens,
                 support_image_tokens,
@@ -578,10 +726,13 @@ class Pi0(_model.BaseModel):
         if self.use_support_context:
             if support_image_tokens is None:
                 support_image_tokens = self._encode_support_images(obs)
+            # Robot trajectory progress is only a training-time label source for
+            # phase-caption selection. It is not a model input because no
+            # semantically equivalent completion progress exists at inference.
             support_tokens, support_token_mask = self._prepare_support_tokens(
                 obs,
                 support_image_tokens,
-                include_chunk_progress=True,
+                include_chunk_progress=False,
             )
             tokens.append(support_tokens)
             input_mask.append(support_token_mask)
