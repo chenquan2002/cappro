@@ -1,0 +1,13 @@
+click_alarmclock
+press_stapler
+open_laptop
+rotate_qrcode
+handover_mic
+pick_dual_bottles
+grab_roller
+move_stapler_pad
+place_empty_cup
+place_bread_basket
+place_a2b_left
+stack_blocks_two
+place_fan
